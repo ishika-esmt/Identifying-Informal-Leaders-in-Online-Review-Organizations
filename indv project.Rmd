@@ -1,0 +1,1450 @@
+---
+title: "Identifying Informal Leaders in Online Review Organizations like Sephora"
+author: "Ishika Narang"
+date: "2025-12-16"
+output: html_document
+---
+
+## Identifying Informal Leaders in Online Review Organizations like Sephora
+
+**Context (organisational problem):**
+Retail organizations increasingly rely on customer review systems as a decentralized “voice of the customer,” but these systems often function like informal organizations where a small subset of reviewers can shape shared beliefs about product quality. When influence is unevenly distributed in the reviews, organizations face the risk of misinterpreting feedback and overreacting to highly visible opinions while overlooking broader patterns, for example by discontinuing a product or pricing it much lower to sell more. Despite the importance of this issue, most review analytics treat all reviewers as equal contributors.
+
+Thus, my project treats Sephora’s review environment as an informal influence network and asks: **who acts as “opinion leaders,” and what signals make their influence stronger?** The project will make use of structuring logic (patterns of relations, brokers/influencers) combined with sensemaking (how text expresses strengths/weaknesses).
+
+### Substantive Question:
+Who are the informal opinion leaders in Sephora’s review ecosystem, and how do they shape collective product evaluations?
+
+### Analytics Questions:
+- Can informal opinion leaders be identified using network position in a reviewer–product network (for example, using centrality, brokerage)?
+
+- Do influential reviewers systematically use different language (for example,  higher confidence, stronger evaluative tone, broader topical scope)?
+
+- Are products reviewed by influential reviewers more likely to experience subsequent changes in ratings or rating volatility?
+
+### Data accessibility plan:
+Kaggle Sephora Products and Skincare Reviews (≈8k products and ~1M skincare reviews, multiple CSV files)
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(tidytext)
+library(sentimentr)
+library(lubridate)
+library(scales)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(vroom) 
+library(scales)
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(stringr)
+
+
+# Set global options
+options(stringsAsFactors = FALSE)
+theme_set(theme_minimal())
+# (for clean paths in projects)
+library(here)
+
+## Helper function: Shannon entropy
+entropy_shannon <- function(x) {
+  p <- x / sum(x)
+  -sum(p * log(p))
+}
+
+```
+
+```{r}
+# load data
+data_dir <- "sephora data"
+
+review_files <- list.files(
+  path = data_dir,
+  pattern = "^reviews_.*\\.csv$",
+  full.names = TRUE
+)
+
+product_file <- file.path(data_dir, "product_info.csv")
+
+product_info_raw <- vroom::vroom(product_file, show_col_types = FALSE) %>%
+  clean_names()
+
+reviews_raw <- vroom::vroom(review_files, id = "source_file", show_col_types = FALSE) %>%
+  clean_names()
+```
+
+```{r}
+glimpse(product_info_raw) # 8494 rows, 27 columns
+glimpse(reviews_raw) # 1,094,411 rows, 20 columns
+```
+
+### Preprocessing and answering the questions:
+#### Step 1 — standardise & validate raw tables
+```{r}
+# quick sanity check
+stopifnot(exists("product_info_raw"), exists("reviews_raw"))
+
+# reviews: drop export index column and standardise types
+reviews_step1 <- reviews_raw %>%
+  select(-matches("^x\\d+$")) %>%           # removes x1 (came from the Kaggle export index)
+  mutate(
+    author_id  = as.character(author_id),  
+    product_id = as.character(product_id),
+    submission_time = as_date(submission_time),
+    rating = as.numeric(rating),
+    is_recommended = as.integer(is_recommended)  # keeping as 0/1 for now (can convert later)
+  )
+
+# product info: ensure IDs and stable types 
+product_info_step1 <- product_info_raw %>%
+  mutate(
+    product_id = as.character(product_id),
+    brand_id   = as.character(brand_id)
+  )
+
+# checking if key fields exist
+required_reviews_cols <- c("author_id", "product_id", "rating", "submission_time", "review_text")
+required_product_cols <- c("product_id", "brand_name", "primary_category", "price_usd")
+
+missing_reviews <- setdiff(required_reviews_cols, names(reviews_step1))
+missing_product <- setdiff(required_product_cols, names(product_info_step1))
+
+if (length(missing_reviews) > 0) {
+  stop("Missing required columns in reviews_step1: ", paste(missing_reviews, collapse = ", "))
+}
+if (length(missing_product) > 0) {
+  stop("Missing required columns in product_info_step1: ", paste(missing_product, collapse = ", "))
+}
+
+# checking merge key quality + uniqueness as i want product table to be 1 row per product_id 
+product_dupes <- product_info_step1 %>%
+  count(product_id) %>%
+  filter(n > 1)
+
+cat("Product_info duplicate product_id rows:", nrow(product_dupes), "\n")
+
+# Basic missingness in keys (should be ~0)
+key_missing <- tibble(
+  pct_missing_author_id  = mean(is.na(reviews_step1$author_id)) %>% percent(),
+  pct_missing_product_id = mean(is.na(reviews_step1$product_id)) %>% percent(),
+  pct_missing_date       = mean(is.na(reviews_step1$submission_time)) %>% percent()
+)
+
+key_missing
+
+# quick check for the scope (will help interpret later)
+scope_checks <- list(
+  review_date_range = range(reviews_step1$submission_time, na.rm = TRUE),
+  n_reviews = nrow(reviews_step1),
+  n_unique_reviewers = n_distinct(reviews_step1$author_id),
+  n_unique_products_in_reviews = n_distinct(reviews_step1$product_id),
+  n_unique_products_in_catalog = n_distinct(product_info_step1$product_id)
+)
+
+scope_checks
+
+# confirm whether reviews are skincare-only
+reviews_primary_categories <- product_info_step1 %>%
+  filter(product_id %in% reviews_step1$product_id) %>%
+  count(primary_category, sort = TRUE)
+
+reviews_primary_categories
+
+```
+
+*Interpretation:*
+
+- Zero duplicate product_ids in product_info - safe to join once, no row explosion.
+
+- 0% missing IDs or dates - can make a network structure and do time-based modelling.
+
+- Date range: 2008–2023 
+
+- Skincare-only review ecosystem (2351 products) - keeps my analysis focused to one category
+
+- thus, my defintion of an "organisation" is a single category amongst all the products offered. Then, I will consider **boundary spanning** to be *across brands, subcategories, and product complexity,* not across unrelated categories (which would not be possible with this dataset anyway).
+
+
+#### Step 2 - Build products_core (product-level controls + complexity)
+
+My goal here to create one clean product table that:
+
+- joins cleanly to reviews,
+
+- captures what makes products structurally different,
+
+- supports all later modelling (network, NLP aggregation, outcomes).
+
+```{r}
+# chose the following features on what made the most sense to be included in judging products
+products_core <- product_info_step1 %>%
+  select(
+    product_id,
+    product_name,
+    brand_id,
+    brand_name,
+    primary_category,
+    secondary_category,
+    tertiary_category,
+    price_usd,
+    sale_price_usd,
+    value_price_usd,
+    loves_count,
+    new,
+    limited_edition,
+    online_only,
+    out_of_stock,
+    sephora_exclusive,
+    variation_type, # for my ref, variations type ex: "Size + Concentration + Formulation", "Scent"
+    variation_value, # ex: 0.25 oz/ 7.5 mL Eau de Parfum Spray
+    child_count, # this means number of variants of a product (like proxy for shade/size, etc)
+    child_min_price,
+    child_max_price
+  ) %>%
+  mutate(
+    # product complexity signals
+    has_variations = !is.na(variation_type) | child_count > 0, 
+    variation_price_range = if_else(
+      !is.na(child_min_price) & !is.na(child_max_price),
+      child_max_price - child_min_price,
+      NA_real_
+    ), 
+    
+    # making sure the flags are binary indicators
+    new               = as.integer(new),
+    limited_edition   = as.integer(limited_edition),
+    online_only       = as.integer(online_only),
+    out_of_stock      = as.integer(out_of_stock),
+    sephora_exclusive = as.integer(sephora_exclusive)
+  )
+
+```
+
+```{r}
+# quick validation check
+glimpse(products_core)
+
+products_core %>%
+  summarise(
+    n_products = n(),
+    pct_with_variations = mean(has_variations) %>% percent(),
+    pct_missing_price = mean(is.na(price_usd)) %>% percent()
+  )
+
+products_core %>%
+  count(has_variations)
+
+```
+
+*Interpretation:* 83% of products have variations - this is expected as product complexity is the norm, not the exception.
+
+#### Step 3 - Build reviews_event (event-level review table)
+
+This table will be my single source of truth for:
+
+- NLP (language, sentiment, certainty)
+
+- Time dynamics (early reviewer)
+
+- Reviewer behaviour (activity, helpfulness)
+
+*Unit is  one row = one review written by one reviewer about one product at one time.*
+
+```{r}
+reviews_event <- reviews_step1 %>%
+  transmute(
+    reviewer_id = author_id,
+    product_id,
+    review_date = submission_time,
+    
+    # core outcomes
+    rating,
+    is_recommended,
+    
+    # eengagement signals
+    total_feedback_count,
+    total_pos_feedback_count,
+    total_neg_feedback_count,
+    
+    helpfulness_ratio = if_else(
+      total_feedback_count > 0,
+      total_pos_feedback_count / total_feedback_count,
+      NA_real_
+    ),
+    
+    # text of the review
+    review_title,
+    review_text,
+    
+    # making text structure features
+    text_n_words  = str_count(review_text, "\\S+"),
+    title_n_words = str_count(review_title, "\\S+"),
+    
+    # reviewer profile (might not use this yet but keep as something for "next steps section"
+    skin_type,
+    skin_tone,
+    eye_color,
+    hair_color
+  ) %>%
+  filter(
+    !is.na(reviewer_id),
+    !is.na(product_id),
+    !is.na(review_date),
+    !is.na(rating)
+  )
+
+```
+
+```{r}
+# quick check
+glimpse(reviews_event)
+
+reviews_event %>%
+  summarise(
+    n_reviews = n(),
+    n_reviewers = n_distinct(reviewer_id),
+    n_products = n_distinct(product_id),
+    pct_missing_text = mean(is.na(review_text) | review_text == "") %>% percent(),
+    pct_missing_helpfulness = mean(is.na(helpfulness_ratio)) %>% percent()
+  )
+
+summary(reviews_event$text_n_words)
+
+```
+
+*Interpretation:*
+- 1,094,347 review events across 503,195 reviewers and 2351 skincare products
+
+- The reviewer base is much larger than the product set, which naturally creates influence asymmetries (a few reviewers can appear across many products).
+
+- 0% missing review text points to the fact that every review can contribute to linguistic sensemaking (will do this at the end)
+
+- 51% missing helpfulness_ratio - this is expected because from experience also it can be seen that many reviews don't get votes. **Thus, i will treat helpfulness as a conditional signal where it can be considered informative when present, ignored otherwise.**
+  - This makes helpfulness a quality-weighting signal, not a required feature.
+  
+- Ratings are cleanly numeric (1–5). is_recommended gives a binary signal that complements star ratings and is useful for robustness checks.
+
+#### Step 4 - Join review events with product structure
+
+My goal here is to create one enriched event table that:
+
+- adds product structure + complexity to each review
+
+- allows aggregation (for network, NLP, outcome modelling)
+
+- is joined once and only once (no messy repeated joins later)
+
+I will use this table for the most part from here on out.
+```{r}
+#joining reviews_event with products_core
+reviews_event_enriched <- reviews_event %>%
+  left_join(products_core, by = "product_id")
+```
+
+```{r}
+# quick check
+glimpse(reviews_event_enriched)
+
+reviews_event_enriched %>%
+  summarise(
+    n_reviews = n(),
+    pct_missing_category = mean(is.na(primary_category)) %>% percent(),
+    pct_missing_price = mean(is.na(price_usd)) %>% percent(),
+    pct_missing_brand = mean(is.na(brand_name)) %>% percent()
+  )
+
+```
+
+```{r}
+# can save this so that i dont lose it 
+saveRDS(reviews_event_enriched, "sephora data/reviews_event_enriched.rds")
+```
+
+*Interpretation:*
+
+- 0% missing category, price, and brand - join between reviews_event and products_core is complete and lossless. So now every review now carries full product context
+
+- has_variations = TRUE for most reviewed products - confirms that variation-heavy products dominate skincare, reinforcing why influence matters: reviews are shaping perceptions in complex choice environments.
+
+- child_count varies (found a lot of 3s) - meaning number of variants of products and it gives us a continuous complexity signal, not just a binary flag.
+
+- variation_price_range is often 0 which means many variants differ in shade/size but not price. 
+
+- Still 1,094,347 reviews - No row duplication or accidental filtering occurred during the join which is very good.
+
+
+#### Step 5 - Build the reviewer–product network edges (edges_rp)
+
+My goal here is to transform review events into a bipartite network with:
+
+- Nodes: reviewers and products
+
+- Edges: reviewer–product relationships
+
+- Weights: how strong/informative that relationship is
+
+This directly supports my first analytics question:
+**Can informal opinion leaders be identified using network position in a reviewer–product network?**
+
+*design choice:* collapse multiple reviews of the same product by the same reviewer into one edge, because i understand influence in a network as exposure to more people, not repetition of the same coments.
+
+```{r}
+
+edges_rp <- reviews_event_enriched %>%
+  group_by(reviewer_id, product_id) %>%
+  summarise(
+    n_reviews_edge = n(),
+    first_review_date = min(review_date, na.rm = TRUE),
+    last_review_date  = max(review_date, na.rm = TRUE),
+    avg_rating = mean(rating, na.rm = TRUE),
+    avg_helpfulness_ratio = mean(helpfulness_ratio, na.rm = TRUE),
+    brand_name = first(brand_name),
+    primary_category = first(primary_category),
+    secondary_category = first(secondary_category),
+    tertiary_category = first(tertiary_category),
+    has_variations = first(has_variations),
+    child_count = first(child_count),
+    price_usd = first(price_usd),
+    .groups = "drop"   
+  )
+
+```
+
+This table is the network and everything else will be derived from it.
+It separates structure (who connects to what), intensity (edge weights), and timing (first vs last exposure).
+
+Uisng this I will:
+
+- compute degree and betweenness cleanly,
+
+- examine boundary spanners and see what other kinds of customer groups there are,
+
+- later link when influential reviewers the way they communicate and phrase their reviews.
+
+```{r}
+# check
+glimpse(edges_rp)
+
+edges_rp %>%
+  summarise(
+    n_edges = n(),
+    n_reviewers = n_distinct(reviewer_id),
+    n_products = n_distinct(product_id),
+    avg_reviews_per_edge = mean(n_reviews_edge)
+  )
+
+summary(edges_rp$n_reviews_edge)
+
+```
+
+*Interpretation:*
+
+- 1,088,824 edges connecting 503,195 reviewers to 2351 products
+*Compare this to 1,094,347 total reviews- means almost every reviewer–product pair occurs only once.*
+  - This is confirmed by: Median reviews per edge = 1, Mean ≈ 1.005, Max = 59 (rare repeat reviewers on the same product). **Thus, the Sephora review ecosystem is wide and shallow, not repetitive. Influence therefore comes from breadth of exposure (reviewing many products), not from repeatedly reviewing the same product.**
+
+- Many NaN values in avg_helpfulness_ratio
+  - means lack of votes, not missing data. When present, helpfulness is meaningful
+  - Organizational implication: Many influential reviewers do not get explicit “helpful” validation — *reinforcing the need for structural measures of influence (my recommendation to retail platforms)*.
+
+
+#### Step 6 - Compute reviewer-level network metrics
+
+Aligned with the proposal, I will compute:
+
+1. Degree centrality -  how many distinct products a reviewer touches
+
+2. Portfolio diversity (boundary spanning)
+
+  - Brand diversity (entropy)
+
+  - Category diversity (entropy)
+
+3. Behavioural signals
+
+- Mean rating
+
+- Mean helpfulness
+
+- Exposure to complex products (variation-heavy)
+
+**These will allow me to classify reviewers into: Specialists (narrow, focused reviewers) VS Generalists (broad, cross-category reviewers)**
+
+```{r}
+
+reviewer_network_metrics <- edges_rp %>%
+  group_by(reviewer_id) %>%
+  summarise(
+    # structural influence
+    degree_products = n(),   # number of distinct products reviewed
+    
+    # portfolio diversity (boundary spanning)
+    brand_entropy = entropy_shannon(table(brand_name)),
+    category_entropy = entropy_shannon(table(secondary_category)),
+    
+    # behavioural signals
+    mean_rating = mean(avg_rating, na.rm = TRUE),
+    mean_helpfulness = mean(avg_helpfulness_ratio, na.rm = TRUE),
+    
+    # exposure to complex products (variations ones - logic behind this was choice availability)
+    pct_variation_products = mean(has_variations),
+    avg_child_count = mean(child_count, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+glimpse(reviewer_network_metrics)
+
+summary(reviewer_network_metrics$brand_entropy)
+summary(reviewer_network_metrics$category_entropy)
+summary(reviewer_network_metrics$degree_products)
+
+```
+
+*Interpretation:*
+
+- **Reviewer activity is extremely skewed:** 503,195 reviewers, median degree_products = 1, mean ~ 2.16, max = 292
+  - Most reviewers participate once in the organization. A tiny minority participates across  hundreds of products.
+  - this happens in informal organizations: influence is structurally concentrated, not evenly distributed.
+  
+- **Portfolio diversity is rare but meaningful when present**
+  - median brand_entropy = 0, median category_entropy = 0
+
+Long right tail:
+  - Brand entropy max ~ 3.86
+  - Category entropy max ~ 2.33
+
+  - **Most reviewers are pure specialists (single brand, single subcategory). A small subset are boundary spanners, reviewing across brands and subcategories.** These reviewers are structurally positioned to compare products, share evaluations, and shape beliefs. This is exactly the kind of actor I am interested in examining.
+  
+-  **Ratings are inflated as** median and mean ratings are very high (typically 4–5). Influential reviewers are not disproportionately negative. *This means that influence here is not about criticism, but about visibility and scope. This is important for managers:* **loud ≠ negative, broad ≠ extreme.**
+
+- again many NaNs in mean_helpfulness. When present, values are high (~ 0.6–1). Helpfulness  should complement, not replace, structural influence measures since mentioned earlier, it is not availabke for everyone and may not be the most reliable.
+
+- pct_variation_products ~ 1 (exposure to complex products ) for many reviewers but avg_child_count varies more. This could mean that reviewers are often evaluating choice-complex products. This *increases the potential for informal leaders to shape how others interpret quality and fit.*
+
+So now i can claim that my informal opinion leaders are those who:
+
+- have high degree
+
+- AND high portfolio entropy
+
+- operate in high-complexity product environments
+
+
+#### Step 7 -  Classify specialists vs boundary spanners
+
+thresholds for 
+- Activity: top decile of degree_products
+
+- Diversity: non-zero entropy (or top quantile)
+
+
+```{r}
+# creating cutiffs
+degree_cutoff <- quantile(reviewer_network_metrics$degree_products, 0.90, na.rm = TRUE)
+entropy_cutoff <- quantile(reviewer_network_metrics$brand_entropy, 0.75, na.rm = TRUE)
+
+reviewer_types <- reviewer_network_metrics %>%
+  mutate(
+    high_activity = degree_products >= degree_cutoff,
+    high_diversity = brand_entropy >= entropy_cutoff,
+    
+    # classifying as one of the 4 categories defined earlier:
+    reviewer_type = case_when(
+      high_activity & high_diversity ~ "Boundary Spanner",
+      high_activity & !high_diversity ~ "High-Activity Specialist",
+      !high_activity & high_diversity ~ "Low-Activity Generalist",
+      TRUE ~ "Peripheral Specialist"
+    )
+  )
+
+```
+
+```{r}
+reviewer_types %>%
+  count(reviewer_type) %>%
+  mutate(
+    pct = percent(n / sum(n))
+  )
+
+```
+
+*Interpretation:*
+- **71.2% Peripheral Specialists** meaning that the vast majority of reviewers contribute once and within a narrow product space.
+
+- Boundary Spanners are rare (10.6% and 53,347 reviewers) and powerful as I explained earlier:
+  -  This is a small but non-trivial group combines high activity and high portfolio diversity across brands and subcategories. **This group is the true informal leadership core.**
+
+- **but activity alone is not influence. we have 2 more categories that have an important role:**
+
+  - High-Activity Specialists: 1.8%
+    - Very active, but narrow focus
+    - Influence is deep but localized
+
+  - Low-Activity Generalists: 16.4%
+    - Broad exposure, but limited visibility
+    - Influence is diffuse
+
+- **Thus, only 10.6% of reviewers combine high activity with broad product exposure* 
+
+#### Step 8 - Visualisations (for EDA):
+
+```{r}
+# for nice lables:
+library(ggrepel)
+
+type_cols <- c(
+  "Boundary Spanner" = "#E45756",         # strong warm highlight
+  "High-Activity Specialist" = "#4C78A8",  # cool blue
+  "Low-Activity Generalist" = "#F2CF5B",   # soft gold
+  "Peripheral Specialist" = "#BDBDBD"      # neutral grey
+) # color palette 
+
+theme_poster <- function() {
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(size = 20, face = "bold", margin = margin(b = 6)),
+      plot.subtitle = element_text(size = 12.5, color = "grey30", margin = margin(b = 10)),
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text  = element_text(size = 12, color = "grey20"),
+      legend.title = element_text(size = 13, face = "bold"),
+      legend.text  = element_text(size = 12),
+      plot.margin = margin(10, 18, 10, 10) #  extra right margin for long titles/legends
+    )
+}
+```
+
+
+**8.1 Degree distribution (log scale)**
+
+addresses:
+- extreme inequality in participation
+
+- why informal leaders exist
+
+- visually shows that averages are misleading
+
+```{r}
+degree_cutoff <- quantile(reviewer_network_metrics$degree_products, 0.90, na.rm = TRUE)
+
+p1 <- ggplot(reviewer_network_metrics, aes(x = degree_products)) +
+  geom_histogram(
+    bins = 60,
+    fill = "#4C78A8",
+    color = "white",
+    alpha = 0.9
+  ) +
+  scale_x_log10(
+    breaks = c(1, 2, 3, 5, 10, 20, 50, 100, 200),
+    labels = comma
+  ) +
+  geom_vline(xintercept = degree_cutoff, linetype = "dashed", linewidth = 0.9, color = "#E45756") +
+  annotate(
+    "label",
+    x = degree_cutoff,
+    y = Inf,
+    label = paste0("Top 10% activity cutoff ≈ ", round(degree_cutoff, 0), " products"),
+    vjust = 1.3,
+    hjust = -0.05,
+    label.size = 0,
+    fill = alpha("white", 0.85)
+  ) +
+  labs(
+    title = "Reviewer activity is highly concentrated",
+    subtitle = str_wrap("Most reviewers contribute once; a small minority reviews many products (log scale).", width = 40),
+    x = "Number of products reviewed (log scale)",
+    y = "Number of reviewers"
+  ) +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_poster()
+
+p1
+
+```
+
+Reviewer participation follows a heavy-tailed distribution: most reviewers contribute once, while a small minority engages across many products, creating structural inequality in influence.
+
+
+**8.2 Degree vs portfolio diversity (very important for my analytical question)**
+
+```{r}
+entropy_cutoff <- quantile(reviewer_network_metrics$brand_entropy, 0.75, na.rm = TRUE)
+
+plot_df <- reviewer_types %>%
+  mutate(is_leader = reviewer_type == "Boundary Spanner")
+
+set.seed(42)
+
+periphery_sample <- plot_df %>%
+  filter(!is_leader)
+
+sample_n <- min(nrow(periphery_sample), 60000)
+
+periphery_sample <- periphery_sample %>%
+  slice_sample(n = sample_n)
+
+leaders_all <- plot_df %>% filter(is_leader)
+
+p2 <- ggplot() +
+  geom_point(
+    data = periphery_sample,
+    aes(x = degree_products, y = brand_entropy),
+    color = "#BDBDBD",
+    alpha = 0.15,
+    size = 0.8
+  ) +
+  geom_point(
+    data = leaders_all,
+    aes(x = degree_products, y = brand_entropy),
+    color = "#E45756",
+    alpha = 0.35,
+    size = 1.2
+  ) +
+  scale_x_log10(labels = comma) +
+  geom_vline(xintercept = degree_cutoff, linetype = "dashed", linewidth = 0.8) +
+  geom_hline(yintercept = entropy_cutoff, linetype = "dashed", linewidth = 0.8) +
+  annotate(
+    "label",
+    x = degree_cutoff,
+    y = entropy_cutoff,
+    label = "Boundary spanners\n(high activity + high breadth)",
+    hjust = -0.05,
+    vjust = -0.2,
+    label.size = 0,
+    fill = alpha("white", 0.85)
+  ) +
+  labs(
+    title = str_wrap("Opinion leadership emerges from activity & portfolio breadth", width = 40),
+    subtitle = str_wrap("Boundary spanners occupy the high-activity, high-diversity corner of the review network.", width = 50),
+    x = "Number of products reviewed (log scale)",
+    y = "Brand diversity (Shannon entropy)"
+  ) +
+  theme_poster()
+
+p2
+
+```
+
+
+**8.3 Density comparison: specialists vs boundary spanners**
+
+goal:
+
+- show how many different kind of reviewers exist in the data
+
+- Makes “boundary spanning” intuitive for non-technical audiences
+
+```{r}
+
+type_share <- reviewer_types %>%
+  count(reviewer_type) %>%
+  mutate(pct = n / sum(n)) %>%
+  arrange(desc(pct))
+
+p3 <- ggplot(type_share, aes(x = reorder(reviewer_type, pct), y = pct, fill = reviewer_type)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = percent(pct, accuracy = 0.1)), hjust = -0.1, size = 4.2, fontface = "bold") +
+  scale_fill_manual(values = type_cols, guide = "none") +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.1))) +
+  coord_flip() +
+  labs(
+    title = str_wrap("Most reviewers are peripheral", width = 40),
+    subtitle = str_wrap("Boundary spanners form a strategically important segment of the ecosystem.", width = 40),
+    x = NULL,
+    y = "Share of reviewers"
+  ) +
+  theme_poster()
+
+p3
+```
+
+lots of peripheral specialists as discussed above. it makes sense for informal leaders (boundary spanners) to be in the proportion they are in. only then can i measure their influence.
+
+**8.4 Category diversity vs degree**
+
+```{r}
+ggplot(
+  reviewer_network_metrics,
+  aes(x = degree_products, y = category_entropy)
+) +
+  geom_point(alpha = 0.2, color = "#4C72B0") +
+  scale_x_log10(labels = comma) +
+  labs(
+    title = str_wrap("Higher activity is associated with broader category exposure", width = 40),
+    subtitle = "Active reviewers span more product categories, not just brands.",
+    x = "Number of products reviewed (log scale)",
+    y = "Category diversity (entropy)"
+  )
+
+```
+
+**explain this graph well in the report**
+
+**8.5 — ECDF (activity inequality by role)**
+```{r}
+p5 <- reviewer_types %>%
+  filter(reviewer_type %in% c("Boundary Spanner", "Peripheral Specialist")) %>%
+  ggplot(aes(degree_products, color = reviewer_type)) +
+  stat_ecdf(linewidth = 1.2) +
+  scale_x_log10(labels = comma) +
+  scale_color_manual(values = type_cols[c(
+    "Boundary Spanner",
+    "Peripheral Specialist"
+  )]) +
+  labs(
+    title = str_wrap("Boundary spanners review disproportionately more products", width = 40),
+    subtitle = "ECDF highlights concentration of reviewing activity among opinion leaders.",
+    x = "Number of products reviewed (log scale)",
+    y = "Cumulative proportion of reviewers",
+    color = "Reviewer type"
+  ) +
+  theme_poster()
+
+p5
+
+```
+
+
+#### Step 9 - Network based influence
+
+**9.1 network visuals**
+
+#### A. Ego-network: “What a boundary spanner connects” 
+This shows *one leader’s (picked one to show what influence looks like) local neighborhood* to understand better.
+
+```{r}
+
+make_trimmed_ego <- function(edge_tbl,
+                             leader_id,
+                             max_products = 40,
+                             max_reviewers = 80,
+                             weight_col = "n_reviews_edge") {
+  stopifnot(all(c("reviewer_id","product_id") %in% names(edge_tbl)))
+
+  # ensure weight are okay
+  if (!weight_col %in% names(edge_tbl)) {
+    edge_tbl[[weight_col]] <- 1L
+  }
+
+  # 1) find leader's products (top N)
+  leader_products <- edge_tbl %>%
+    filter(reviewer_id == leader_id) %>%
+    arrange(desc(.data[[weight_col]])) %>%
+    distinct(product_id, .keep_all = TRUE) %>%
+    slice_head(n = max_products) %>%
+    pull(product_id)
+
+  # 2) find other reviewers who overlap on those products (top M)
+  overlapping_reviewers <- edge_tbl %>%
+    filter(product_id %in% leader_products) %>%
+    filter(reviewer_id != leader_id) %>%
+    count(reviewer_id, name = "shared_products") %>%
+    arrange(desc(shared_products)) %>%
+    slice_head(n = max_reviewers) %>%
+    pull(reviewer_id)
+
+  # nodes kept
+  keep_reviewers <- c(leader_id, overlapping_reviewers)
+  keep_products  <- leader_products
+
+  ego_edges <- edge_tbl %>%
+    filter(reviewer_id %in% keep_reviewers,
+           product_id  %in% keep_products) %>%
+    mutate(weight = .data[[weight_col]])
+
+  # build tidygraph bipartite graph
+  g <- tbl_graph(
+    nodes = tibble(name = c(keep_reviewers, keep_products)) %>%
+      mutate(node_type = if_else(name %in% keep_reviewers, "Reviewer", "Product"),
+             is_leader = name == leader_id),
+    edges = ego_edges %>%
+      transmute(from = match(reviewer_id, c(keep_reviewers, keep_products)),
+                to   = match(product_id,  c(keep_reviewers, keep_products)),
+                weight = weight),
+    directed = FALSE
+  )
+
+  g
+}
+
+```
+
+
+```{r}
+# Choose a boundary spanner id 
+leader_id <- 1696370280  # can change this, i just manually put one in
+
+
+ego_g <- make_trimmed_ego(
+  edge_tbl = edges_rp, 
+  leader_id = leader_id,
+  max_products = 30,
+  max_reviewers = 60,
+  weight_col = "n_reviews_edge"
+)
+
+ego_g
+```
+
+```{r}
+set.seed(42)
+
+p9_1A <- ggraph(ego_g, layout = "stress") +
+  geom_edge_link(aes(alpha = weight),
+                 color = "grey60", linewidth = 0.35, show.legend = FALSE) +
+  scale_edge_alpha(range = c(0.10, 0.60)) +
+
+  geom_node_point(
+    aes(shape = node_type, size = node_type),
+    color = "grey20",
+    alpha = 0.85
+  ) +
+  scale_shape_manual(values = c("Reviewer" = 16, "Product" = 15)) +
+  scale_size_manual(values = c("Reviewer" = 2.2, "Product" = 2.0), guide = "none") +
+
+  # leader highlight ring + filled point
+  geom_node_point(aes(filter = is_leader),
+                  shape = 21, size = 9, stroke = 1.2,
+                  fill = type_cols["Boundary Spanner"], color = "white") +
+  geom_node_point(aes(filter = is_leader),
+                  color = type_cols["Boundary Spanner"], size = 5) +
+
+  # label only the leader 
+  geom_node_text(aes(label = ifelse(is_leader, "Boundary spanner", "")),
+                 fontface = "bold", size = 5, vjust = -1) +
+
+  labs(
+    title = "Ego-network of a boundary spanner (trimmed)",
+    subtitle = str_wrap("Top products reviewed by the boundary spanner + the reviewers who overlap most on those products.", width = 45),
+    caption = "Circles = reviewers, squares = products. Edges weighted by repeated reviews on a product."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 12.5, color = "grey30"),
+    legend.position = "bottom"
+  )
+
+p9_1A
+```
+
+*Interpretations:* This ego-network shows how a boundary spanner creates influence structurally. The highlighted reviewer (red) is directly connected to many products (squares), but the key signal is that those products are also reviewed by multiple other reviewers (circles). That shared overlap is the mechanism through which opinions can “travel”.Meaning that when the boundary spanner reviews products that many others also touch, their evaluations sit in the high-visibility part of the network, shaping the same product conversations other reviewers participate in. In organizational terms, the boundary spanner is not just active—they occupy a broker-like position that links multiple product clusters and exposes their judgments across a wider audience than a typical specialist.
+
+*can insert more visualisations here - mention in next steps too*
+
+
+#### Step 10 - Outcome relevance
+
+This is where I examine why boundary spanners matter - rq2  
+
+**10.1 Do boundary spanners write different reviews?**
+
+*Rationale:* If boundary spanners are informal opinion leaders, their reviews should differ in impact, not just volume. So will look at if they receive higher helpfulness scores and whether their ratings differ from peripheral reviewers, controlling for activity.
+
+- Outcome 1: mean_helpfulness (or log(helpfulness))
+- Outcome 2: mean_rating
+- Key predictor: reviewer_type
+- Control: degree_products (activity)
+
+```{r}
+# select the relevant features
+reviewer_outcomes <- reviewer_types %>%
+  select(
+    reviewer_id,
+    reviewer_type,
+    degree_products,
+    mean_rating,
+    mean_helpfulness
+  )
+# compute outcomes
+reviewer_outcomes %>%
+  group_by(reviewer_type) %>%
+  summarise(
+    n = n(),
+    avg_rating = mean(mean_rating, na.rm = TRUE),
+    avg_helpfulness = mean(mean_helpfulness, na.rm = TRUE),
+    median_helpfulness = median(mean_helpfulness, na.rm = TRUE)
+  )
+
+```
+
+*All reviewer types give very similar average ratings (~ 4.24–4.42).This already hints that boundary spanners are not simply more positive or harsher than others (saw this earlier in another form).* Boundary spanners do not dominate by extreme scores, instead their influence is structural, not emotional or biased. Similarly overall helpfulness is also similar for all the categories. Keeping the fact that helpfulness and rating is not given to each reviewer so there is some bias in these values so I will not fully use this as a representative measure.
+
+```{r}
+# plotting
+ggplot(reviewer_outcomes,
+       aes(x = reviewer_type, y = mean_helpfulness, fill = reviewer_type)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  scale_fill_manual(values = type_cols, guide = "none") +
+  coord_cartesian(ylim = quantile(reviewer_outcomes$mean_helpfulness, c(0, 0.95), na.rm = TRUE)) +
+  labs(
+    title = str_wrap("Boundary spanners receive more helpfulness on average", width= 45),
+    subtitle = "Distribution of reviewer-level helpfulness scores by reviewer type",
+    x = NULL,
+    y = "Mean helpfulness score"
+  ) +
+  theme_poster() + scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  theme(
+    axis.text.x = element_text(size = 12)
+  )
+
+
+```
+
+*Boundary spanners show: high central tendency (median around 0.8), tight upper distribution, meaning many of their reviews are consistently seen as helpful*
+
+Peripheral specialists have slightly higher medians, but they are typically reviewing within narrow niches and their influence does not travel across product or category boundaries.
+
+
+```{r}
+# simple linear regression
+lm_help <- lm(
+  mean_helpfulness ~ reviewer_type + log1p(degree_products),
+  data = reviewer_outcomes
+)
+
+summary(lm_help)
+
+```
+
+- Baseline: boundary Spanner with expected helpfulness of approx 0.80 (decent score for an informal leader)
+
+- Reviewer type coefficients (relative to Boundary Spanner) are small but statistically significant because sample is large.
+
+- activity effect (log1p(degree_products)): Negative and significant because  *as reviewers become more active, their average helpfulness slightly declines, probably due to the scale and attention constraints of the other reviewers*
+
+- **Even after controlling for activity level, boundary spanners retain a small but systematic advantage in perceived helpfulness. This suggests that their value is not driven by volume alone, but by the informational breadth and relevance of their reviews.**
+
+- **The R² is very low — this is expected. Helpfulness is noisy and affected by many unobserved factors. Statistical significance here indicates directional relevance, not predictive power.**
+
+**alternative 2 for plot (annoatated for poster):**
+```{r}
+
+# make labels wrap nicely
+reviewer_outcomes <- reviewer_outcomes %>%
+  mutate(reviewer_type_wrapped = stringr::str_wrap(reviewer_type, width = 14))
+
+# compute medians for annotation
+helpfulness_medians <- reviewer_outcomes %>%
+  group_by(reviewer_type_wrapped) %>%
+  summarise(med = median(mean_helpfulness, na.rm = TRUE), .groups = "drop")
+
+p_helpfulness <- ggplot(reviewer_outcomes,
+                        aes(x = reviewer_type_wrapped, y = mean_helpfulness, fill = reviewer_type)) +
+  geom_boxplot(width = 0.70, outlier.alpha = 0.25) +
+ 
+  geom_text(
+    data = helpfulness_medians,
+    aes(x = reviewer_type_wrapped, y = med, label = sprintf("median = %.3f", med)),
+    inherit.aes = FALSE,
+    vjust = -1.1,
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1.05)) +
+  scale_fill_manual(values = type_cols, guide = "none") +
+  labs(
+    title = str_wrap("Boundary spanners receive more helpfulness on average(differences are subtle)", width= 45),
+    subtitle = "Distribution of reviewer-level helpfulness scores by reviewer type",
+    x = NULL,
+    y = "Mean helpfulness score"
+  ) +
+  theme_poster() +
+  theme(axis.text.x = element_text(lineheight = 0.95))
+
+p_helpfulness
+
+```
+
+The annotated boxplot shows that differences in helpfulness are real but subtle. Median helpfulness increases from Boundary Spanners (0.817) to High-Activity Specialists (0.857), Low-Activity Generalists (0.875), and is highest for Peripheral Specialists (0.917).
+
+Two important takeaways:
+
+- **Boundary Spanners do not dominate on raw helpfulness scores, despite their structural importance.** Their median is slightly lower than other groups, suggesting that their influence is not driven by writing reviews that are rated as more helpful on average, but rather by where and when they contribute.
+
+- **The large overlap in interquartile ranges indicates that helpfulness alone cannot explain reviewer influence.** This aligns with intuition that boundary spanners matter because they bridge domains, not because they produce systematically “better rated” text.
+
+Influence in the system is structural rather than purely evaluative.
+
+
+**10.2 Do boundary spanners write reviews earlier?**
+
+*Logic:* Opinion leaders don’t just influence, they may also arrive early and thus influence a lot of people after them**
+
+This,I will find for each review:How early was it relative to the product’s review lifecycle?
+
+```{r}
+review_timing <- edges_rp %>%
+  mutate(review_date = first_review_date) %>% # define the date we use for timing
+  group_by(product_id) %>%
+  mutate(
+    first_review = min(review_date, na.rm = TRUE),
+    last_review  = max(review_date, na.rm = TRUE),
+    lifecycle_pos = as.numeric(review_date - first_review) /
+      as.numeric(last_review - first_review)
+  ) %>%
+  ungroup() %>%
+  # avoid division by zero when product has only 1 review date
+  mutate(lifecycle_pos = ifelse(is.finite(lifecycle_pos), lifecycle_pos, NA_real_)) %>%
+  left_join(
+    reviewer_types %>% select(reviewer_id, reviewer_type),
+    by = "reviewer_id"
+  )
+
+review_timing %>% dplyr::select(product_id, reviewer_id, review_date, first_review, last_review, lifecycle_pos, reviewer_type) %>% head()
+```
+
+lifecycle_pos ∈ [0,1]
+
+- 0 = first reviewers that are very early in product life
+- 1 = late adopters 
+
+```{r}
+# plotting 
+ggplot(review_timing,
+       aes(x = reviewer_type, y = lifecycle_pos, fill = reviewer_type)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  scale_fill_manual(values = type_cols, guide = "none") +
+  labs(
+    title = str_wrap("Boundary spanners review earlier in the product lifecycle", width = 40),
+    subtitle = "Relative timing of reviews by reviewer type",
+    x = NULL,
+    y = "Relative position in product review lifecycle"
+  ) +
+  theme_poster() + scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  theme(
+    axis.text.x = element_text(size = 12)
+  )
+
+```
+
+**plot for poster with annotations**:
+```{r}
+# Build review timing using first_review_date as the event time per reviewer–product
+review_timing <- edges_rp %>%
+  mutate(review_date = first_review_date) %>%   # FIX: create review_date explicitly
+  group_by(product_id) %>%
+  mutate(
+    first_review = min(review_date, na.rm = TRUE),
+    last_review  = max(review_date, na.rm = TRUE),
+    denom_days   = as.numeric(last_review - first_review),
+    lifecycle_pos = ifelse(denom_days <= 0, NA_real_,
+                           as.numeric(review_date - first_review) / denom_days)
+  ) %>%
+  ungroup() %>%
+  left_join(reviewer_types %>% select(reviewer_id, reviewer_type), by = "reviewer_id") %>%
+  mutate(reviewer_type_wrapped = stringr::str_wrap(reviewer_type, width = 14))
+
+# Medians for annotation
+lifecycle_medians <- review_timing %>%
+  group_by(reviewer_type_wrapped) %>%
+  summarise(med = median(lifecycle_pos, na.rm = TRUE), .groups = "drop")
+
+p_lifecycle <- ggplot(review_timing,
+                      aes(x = reviewer_type_wrapped, y = lifecycle_pos, fill = reviewer_type)) +
+  geom_boxplot(width = 0.70, outlier.alpha = 0.25) +
+  geom_text(
+    data = lifecycle_medians,
+    aes(x = reviewer_type_wrapped, y = med, label = sprintf("median = %.2f", med)),
+    inherit.aes = FALSE,
+    vjust = -1.1,
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_y_continuous(limits = c(0, 1.05)) +
+  scale_fill_manual(values = type_cols, guide = "none") +
+  labs(
+    title = str_wrap("When do different reviewer types show up in a product’s review lifecycle?", width=40),
+    subtitle = "Lifecycle position: 0 = very early, 1 = very late ",
+    x = NULL,
+    y = "Relative position in product review lifecycle"
+  ) +
+  theme_poster() +
+  theme(axis.text.x = element_text(lineheight = 0.95))
+
+p_lifecycle
+```
+
+*Interpretations:*
+- The **boxplot** shows **heavy overlap** across all types -the timing differences exist, but they’re **not dramatic**
+
+- If boundary spanners were early movers then i expected their median and distribution to be shifted **lower**. but the honest takeaway is: **boundary spanners may be slightly earlier, but the effect is subtle** and needs a simple stat test to back it.
+
+- High-Activity Specialists review earliest (median 0.24) -  rapid engagement once products enter the market.
+
+- Boundary Spanners and Low-Activity Generalists appear slightly later but still early in the lifecycle (both medians approx 0.31).
+
+- Peripheral Specialists are marginally later (median 0.30), consistent with more niche or delayed engagement.
+
+*Crucially, Boundary Spanners systematically appear early, though not the very earliest. This positions them as early cross-category sense-makers, entering after initial specialist attention but before reviews become widespread.*
+
+**This timing pattern strengthens my core claim that Boundary Spanners help translate and diffuse product information across domains during early adoption phases, rather than acting as first movers or late followers**.
+
+Because lifecycle_pos is bounded [0,1] and visibly non-normal, a non-parametric test is appropriate.
+
+Overall test: Kruskal–Wallis
+```{r}
+kruskal.test(lifecycle_pos ~ reviewer_type, data = review_timing)
+# A significant p-value indicates that at least one reviewer type differs in review timing.
+```
+
+The Kruskal–Wallis test asks:
+**“Do the distributions of lifecycle position differ across reviewer types?”**
+
+There is a statistically significant difference in when different reviewer types appear in the product lifecycle.
+
+This means: observed differences in medians **are not due to random noise, even though they look small visually.** This happens in large datasets where **small but systematic behavioral differences become highly detectable through the test**
+
+statistical significance justified pairwise follow-ups
+Now I answer: **Which reviewer types differ from each other?**
+
+```{r}
+# post-hoc pairwise comparisons (Wilcoxon + correction)
+pairwise.wilcox.test(
+  review_timing$lifecycle_pos,
+  review_timing$reviewer_type,
+  p.adjust.method = "holm"
+)
+
+```
+Pairwise Wilcoxon tests with Holm correction show that all reviewer types are statistically distinct from one another. Reviewer types differ systematically in when they contribute reviews, even though absolute differences are modest.
+
+**Boundary spanners:**
+
+- are not the very first reviewers
+
+- But they appear earlier than peripheral low-involvement reviewers
+
+- This fits the theory that they step in once a product has some traction, acting as cross-category translators rather than pure pioneers
+
+**High-Activity Specialists:**
+
+- These reviewers behave lik early adopters and domain experts
+
+- anchor the initial phase of the review lifecycle
+
+**Low-Activity Generalists:**
+
+- They enter once products are already somewhat established
+
+- Likely reflect mainstream adoption
+
+**Peripheral Specialists**
+
+- These reviewers are late entrants
+
+- They contribute once products are well known
+
+- Consistent with lower influence and visibility
+
+
+#### Step 11 - NLP: What Boundary Spanners say
+
+Move from who boundary spanners are and when they act - to how they communicate.
+
+Is boundary-spanning influence reflected in language? - answering rq3 
+
+**11.1 Language diversity**
+
+Do boundary spanners use broader, less repetitive language?
+
+Intuition:
+
+- Specialists - narrow vocabulary
+
+- Peripheral reviewers - short, repetitive language
+
+- Boundary spanners - higher lexical diversity
+
+**metric choice: Type–Token Ratio (TTR) at the reviewer level:** unique words/total words
+
+```{r}
+reviews_clean <- reviews_event_enriched
+colnames(reviews_clean)
+
+```
+
+```{r}
+tokens <- reviews_clean %>%
+  select(reviewer_id, review_text) %>%
+  filter(!is.na(review_text)) %>%
+  unnest_tokens(word, review_text) %>%
+  filter(!word %in% stop_words$word)
+
+```
+
+```{r}
+lexical_diversity <- tokens %>%
+  group_by(reviewer_id) %>%
+  summarise(
+    total_words = n(),
+    unique_words = n_distinct(word),
+    ttr = unique_words / total_words,
+    .groups = "drop"
+  ) %>%
+  filter(total_words >= 50)   # avoid tiny reviewers
+
+```
+
+```{r}
+lexical_diversity <- lexical_diversity %>%
+  left_join(
+    reviewer_types %>% select(reviewer_id, reviewer_type),
+    by = "reviewer_id"
+  )
+table(lexical_diversity$reviewer_type)
+
+```
+
+```{r}
+# plot 
+
+p_ttr <- ggplot(
+  lexical_diversity,
+  aes(x = reviewer_type, y = ttr, fill = reviewer_type)
+) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  labs(
+    title = "Language diversity by reviewer type",
+    subtitle = "Type–Token Ratio (unique words / total words)",
+    x = NULL,
+    y = "Lexical diversity (TTR)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 20, hjust = 1)
+  )
+
+p_ttr
+
+```
+
+This plot compares Type–Token Ratio (TTR) (the share of unique words relative to total words) across reviewer types. Higher values indicate richer, more varied language.
+
+- **Boundary spanners use moderately diverse but controlled language.** Their reviews are not verbose for the sake of verbosity, instead, they **reuse a stable vocabulary across products. This suggests consistency and transferability of evaluative language, which aligns with their cross-category role.** They sound like experienced translators of product quality rather than storytellers.
+
+- **High-Activity Specialists - despite high activity, specialists do not exhibit richer language.** Their **vocabulary remains constrained, likely reflecting domain-specific jargon within a narrow category**. High activity ≠ linguistic breadth.
+
+- **Low-Activity Generalists (highest median) - use more varied language per review**, likely because they **review infrequently so each review is written from scratch and they rely less on repeated review templates**. Linguistic diversity here reflects individuality, not influence.
+
+- **Peripheral specialists (widest dispersion) are linguistically inconsistent**. Some write short, repetitive reviews, others write long, expressive ones. This **heterogeneity fits their peripheral position as they are not structurally embedded enough to develop a stable reviewing voice**
+
+**Thus, Boundary spanners are not the most linguistically diverse reviewers, instead they use controlled, repeatable language that travels well across products and categories.**
+This is goes against what I expected but it makes sense.
+
+Takeaways:
+
+- Influence does not come from novelty of expression
+
+- It comes from standardisation, clarity, and recognisable evaluative frames
+
+- Low-activity generalists sound creative
+
+- Boundary spanners sound credible. They shape collective evaluation not by being louder or more expressive, but by establishing a shared language of quality that others implicitly follow.
+
+
+**11.2 What boundary spanners talk about**
+
+at this point, I have found that boundary spanners:
+
+- are early(ish)
+
+- are structurally central
+
+- use controlled language
+
+Now I will examine:
+**Do boundary spanners talk about products differently in content, not just style?**
+
+```{r}
+
+tokens <- reviews_clean %>%
+  select(reviewer_id, review_text) %>%
+  filter(!is.na(review_text)) %>%
+  unnest_tokens(word, review_text) %>%
+  filter(!word %in% stop_words$word) %>%
+  filter(str_detect(word, "[a-z]"))
+head(tokens)
+
+```
+
+This table confirms that tokenisation worked as intended as each row represents a single cleaned word token extracted from a review, linked to a specific reviewer. Seeing concrete product-related terms such as “nudestix,” “citrus,” “balm,” and “melt” indicates that stop-words and noise were successfully removed and that the remaining vocabulary captures substantive product descriptors rather than generic filler text. This is an important validation step for NLP pipelines, as it ensures that measures (TF-IDF, lexical diversity) are based on semantically meaningful language.
+
+```{r}
+# Token volume by reviewer type
+tokens_by_type <- tokens %>%
+  left_join(
+    reviewer_types %>% select(reviewer_id, reviewer_type),
+    by = "reviewer_id"
+  ) %>%
+  filter(!is.na(reviewer_type))
+table(tokens_by_type$reviewer_type)
+
+```
+Boundary Spanner                High-Activity Specialist      Low-Activity Generalist 
+                 9,949,743                   915,523                  4,342,873 
+   
+   Peripheral Specialist 
+                 8,760,358 
+                 
+The token counts by reviewer type show large and systematic differences in language volume, with Boundary Spanners contributing by far the largest number of tokens, followed by Peripheral Specialists, Low-Activity Generalist and then High-Activity Specialists. This reflects structural differences in reviewing behaviour rather than data issues: Boundary Spanners write with lesser lexical diversity but write a lot on average, Low-Activity Generalists tend to write fewer reviews overall but more creative ones, while High-Activity Specialists distribute their effort across many reviews with more diverse language. This explains why TF-IDF (which normalises for frequency) is the appropriate method here instead of raw word counts.
+
+```{r}
+tfidf_by_type <- tokens_by_type %>%
+  count(reviewer_type, word, sort = TRUE) %>%
+  bind_tf_idf(word, reviewer_type, n)
+
+top_terms <- tfidf_by_type %>%
+  group_by(reviewer_type) %>%
+  slice_max(tf_idf, n = 12) %>%
+  ungroup()
+
+top_terms %>% count(reviewer_type)
+
+```
+
+Top-terms count per reviewer type (n = 12–15)
+
+This table confirms that the TF-IDF extraction step behaved consistently across reviewer types, producing a balanced number of distinctive terms per group. The slight difference for High-Activity Specialists (15 instead of 12) reflects higher lexical fragmentation in that group. Crucially, this means comparisons across reviewer types are fair and each group is represented by a similarly sized set of high-signal words (allows interpretation to focus on qualitative differences in language, not becayse of unequal sampling).
+
+```{r}
+# plot
+
+ggplot(
+  top_terms,
+  aes(x = reorder(word, tf_idf), y = tf_idf, fill = reviewer_type)
+) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ reviewer_type, scales = "free") +
+  coord_flip() +
+  labs(
+    title = "Distinctive language by reviewer type",
+    subtitle = str_wrap("Top TF–IDF terms highlight how different reviewer types frame product evaluations", width = 40),
+    x = NULL,
+    y = "TF–IDF"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+- **Boundary Spanners’ distinctive terms are dominated by brand names and product formats (facegym, serum, shampoo, balm, cream),** - language style  bridges multiple product categories and usage contexts. **Rather than focusing narrowly on technical attributes, Boundary Spanners appear to frame products in terms of how they fit into broader routines and comparative experiences**. 
+
+- **High-Activity Specialists’ language is more technical, evaluative, and performance-oriented, with terms like texture, scent, formula, and ingredient-specific references.** This reflects  expertise within a narrower domain. **Their distinctive vocabulary aligns with an expert reviewer role rather than narrative or contextual comparison.**
+
+- **Low-Activity Generalists display the highest lexical diversity and narrative richness, with distinctive terms that mix sensory descriptors (sunless, realistic), product names, and experiential language.** This suggests that **although they review fewer products, their reviews are more exploratory and descriptive, often situating products within personal routines or first-time experiences.** Their language are more story-driven, which aligns with their position as infrequent but expressive contributors rather than habitual reviewers.
+
+- **Peripheral Specialists’ distinctive terms combine procedural, contextual, and situational language (like prescription, guide, sessions, dentist), indicating reviews that are highly specific but context-dependent** Unlike High-Activity Specialists, whose are experts, Peripheral Specialists appear to write related to **particular needs, constraints, or moments. This helps explain why they score high on helpfulness despite lower network centrality**. Their language is actionable and concrete, even if not broadly comparative.
+
+*Conclusion: Together, these outputs show that boundary spanning is reflected not just in network structure, but in language itself. Boundary Spanners use integrative, brand-spanning vocabulary, specialists focus on technical evaluation, generalists provide narrative richness, and Peripheral Specialists contribute situational expertise.*
+
+
